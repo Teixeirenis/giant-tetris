@@ -222,6 +222,7 @@
   .seg { display: inline-flex; align-self: flex-start; padding: 3px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 999px; }
   .seg button { padding: 7px 16px; color: var(--muted); background: transparent; border: 0; border-radius: 999px; cursor: pointer; }
   .seg button[aria-pressed="true"] { color: var(--text); background: rgba(192, 132, 252, 0.24); }
+  @media (max-width: 420px) { .seg button { padding: 7px 10px; font-size: 12px; } }
   .join-row { display: flex; gap: 8px; }
   .code-field { flex: 1; font-weight: 600; letter-spacing: 0.3em; text-transform: uppercase; }
   .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
@@ -3053,9 +3054,14 @@
     if (cur) drawGhost();
 
     if (state === 'over') ctx.globalAlpha = 0.45;
+    // While a clear animates, only its columns show the board from just before the clear;
+    // everyone else's area keeps drawing live.
     for (let y = HIDDEN; y < H; y++) {
-      const row = view[y], gone = clearSet && clearSet.has(y);
-      for (let x = 0; x < COLS; x++) if (row[x] && !(gone && x >= cx0 && x < cx1)) drawCell(row[x], x, y);
+      const gone = clearSet && clearSet.has(y);
+      for (let x = 0; x < COLS; x++) {
+        const inClear = x >= cx0 && x < cx1, c = (inClear ? view : board)[y][x];
+        if (c && !(gone && inClear)) drawCell(c, x, y);
+      }
     }
     ctx.globalAlpha = 1;
     if (clearing) drawClearing(clearing, view, clearMs, cx0, cx1);

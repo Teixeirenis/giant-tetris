@@ -321,6 +321,10 @@
   .slot.open { justify-content: center; font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); border-style: dashed; }
   .slot.me { border-color: var(--edge-2); }
   .lobby-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+  .lobby-mode { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+  .lobby-mode .hint { flex-basis: 100%; }
+  .seg button:disabled { cursor: default; }
+  .seg button:disabled:not([aria-pressed="true"]) { opacity: 0.45; }
 
   /* ---------- Game ---------- */
   .game-screen { display: flex; flex-direction: column; overflow: hidden; }
@@ -445,6 +449,12 @@
               <button type="button" id="visPrivate" aria-pressed="false">Private</button>
             </div>
             <p class="hint" id="visHint"></p>
+            <span class="lbl">Game mode</span>
+            <div class="seg" role="group" aria-label="Game mode">
+              <button type="button" id="modeShared" aria-pressed="true">Shared board</button>
+              <button type="button" id="modeSplit" aria-pressed="false">Split board</button>
+            </div>
+            <p class="hint" id="modeHint"></p>
             <div class="row-end">
               <button type="button" class="ghost-btn" id="createCancel">Cancel</button>
               <button type="submit" class="btn">Create lobby</button>
@@ -520,6 +530,14 @@
         </div>
       </div>
       <ol class="slots" id="slots"></ol>
+      <div class="lobby-mode">
+        <span class="lbl">Game mode</span>
+        <div class="seg" role="group" aria-label="Game mode">
+          <button type="button" id="lobbyShared" aria-pressed="true">Shared board</button>
+          <button type="button" id="lobbySplit" aria-pressed="false">Split board</button>
+        </div>
+        <p class="hint" id="lobbyModeHint"></p>
+      </div>
       <div class="lobby-foot">
         <p class="note" id="lobbyNote"></p>
         <div class="row-end">
@@ -559,7 +577,7 @@
   const COLS = 50, ROWS = 20, HIDDEN = 2, H = ROWS + HIDDEN;
   const DAS = 140, ARR = 22, SOFT_MS = 50, LOCK_MS = 500, MAX_RESETS = 15, DOUBLE_TAP_MS = 250;
   const CLEAR_MS = 520, LINES_PER_LEVEL = 5, NEXT_N = 5, MINI = 15;
-  const MAX_PLAYERS = 5, PROTOCOL = 1, AV = 16;
+  const MAX_PLAYERS = 5, PROTOCOL = 2, AV = 16;
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   const SHAPES = {
@@ -765,6 +783,8 @@
   const menuArt = $('menuArt'), soloBtn = $('soloBtn'), createBtn = $('createBtn'), createForm = $('createForm');
   const lobbyNameInput = $('lobbyNameInput'), visPublic = $('visPublic'), visPrivate = $('visPrivate');
   const visHint = $('visHint'), createCancel = $('createCancel');
+  const modeShared = $('modeShared'), modeSplit = $('modeSplit'), modeHint = $('modeHint');
+  const lobbyShared = $('lobbyShared'), lobbySplit = $('lobbySplit'), lobbyModeHint = $('lobbyModeHint');
   const joinForm = $('joinForm'), codeInput = $('codeInput'), joinBtn = $('joinBtn'), joinHint = $('joinHint');
   const netStatus = $('netStatus'), onlineCount = $('onlineCount'), lobbyList = $('lobbyList'), lobbyEmpty = $('lobbyEmpty');
   const profileTitle = $('profileTitle'), profileSub = $('profileSub'), avPreview = $('avPreview');
@@ -792,6 +812,7 @@
   let clearFx = null;             // multiplayer line clears are visual only
   let particles = [], popups = [], trails = [], flash = null, shake = 0;
   let countdownT = 0, lastBeep = 0, pieceDrop = 0, frameDt = 16;
+  let lane = null; // { x0, x1 }: the columns this player owns on a split board
   const otherVis = new Map();
 
   // Multiplayer state. Everything travels as room presence, which every admitted viewer may set.
@@ -837,15 +858,17 @@
   }
   const makeNext = () => { const type = nextType(); return { type, color: pick(SHADES[type]) }; };
 
-  function collideOn(b, type, rot, x, y) {
+  // `lim` narrows the walls to one player's area on a split board.
+  function collideOn(b, type, rot, x, y, lim) {
+    const x0 = lim ? lim.x0 : 0, x1 = lim ? lim.x1 : COLS;
     for (const [cx, cy] of CELLS[type][rot]) {
       const bx = x + cx, by = y + cy;
-      if (bx < 0 || bx >= COLS || by >= H) return true;
+      if (bx < x0 || bx >= x1 || by >= H) return true;
       if (by >= 0 && b[by][bx]) return true;
     }
     return false;
   }
-  const collide = (type, rot, x, y) => collideOn(board, type, rot, x, y);
+  const collide = (type, rot, x, y) => collideOn(board, type, rot, x, y, lane);
   const grounded = () => collide(cur.type, cur.rot, cur.x, cur.y + 1);
 
   function bounds(type, rot) {
@@ -857,9 +880,20 @@
     return { minX, maxX, minY, maxY };
   }
 
+  // Split board: lobby state carries md 1 and nz areas; roster entry z is that player's area,
+  // fixed when the round starts (-1 for someone who joined mid-round and is watching).
+  const isSplit = s => !!(s && s.md === 1 && s.nz > 0);
+  const laneCols = (k, n) => ({ x0: Math.round(k * COLS / n), x1: Math.round((k + 1) * COLS / n) });
+  const laneOf = (s, r) => (isSplit(s) && r && r.z >= 0 && r.z < s.nz ? laneCols(r.z, s.nz) : null);
+  const playerLevel = r => 1 + Math.floor((r ? r.ln : 0) / LINES_PER_LEVEL);
+
   // In multiplayer each player gets an equal share of the width to spawn in.
   function myZone() {
     if (mode !== 'multi' || !net.hs) return null;
+    if (isSplit(net.hs)) {
+      const r = myEntry();
+      return lane && r ? { x0: lane.x0, x1: lane.x1, color: SLOT_COLORS[r.s] || SLOT_COLORS[0] } : null;
+    }
     const act = activeRoster(net.hs).sort((a, b) => a.s - b.s);
     const k = act.findIndex(r => r.p === net.me);
     if (k < 0) return null;
@@ -976,13 +1010,14 @@
     if (full.length) startClear(full); else spawn();
   }
 
-  function burstRows(rows, src) {
+  function burstRows(rows, src, x0 = 0, x1 = COLS) {
     if (reduceMotion || particles.length > 1500) return;
+    const mid = (x0 + x1) / 2, half = (x1 - x0) / 2;
     for (const y of rows) {
-      for (let x = 0; x < COLS; x++) {
+      for (let x = x0; x < x1; x++) {
         const color = src[y] && src[y][x];
         if (!color) continue;
-        const delay = Math.abs(x + 0.5 - COLS / 2) / (COLS / 2) * CLEAR_MS * 0.55;
+        const delay = Math.abs(x + 0.5 - mid) / half * CLEAR_MS * 0.55;
         for (let k = 0; k < 3; k++) {
           const a = Math.random() * Math.PI * 2, sp = (0.4 + Math.random() * 1.4) * cs * 6;
           particles.push({
@@ -1055,6 +1090,7 @@
 
   function startSolo() {
     mode = 'solo';
+    lane = null;
     audioOn();
     resetPieces();
     board = emptyBoard();
@@ -1125,13 +1161,22 @@
         (score >= best && score > 0 ? '<br>New best score.' : `<br>Best: ${fmt(best)}`);
       setButtons('Play again', 'Menu');
     } else if (kind === 'mover') {
-      const s = net.hs;
+      const s = net.hs, split = isSplit(s);
+      const ranked = s.ro.filter(r => !split || r.z >= 0).sort((a, b) => b.sc - a.sc);
       ovTitle.textContent = 'GAME OVER';
-      ovText.innerHTML = `Team score <strong>${fmt(s.sc)}</strong> &middot; <strong>${s.ln}</strong> lines &middot; level <strong>${s.lv}</strong>` +
-        (net.host ? '' : '<br>Waiting for the host to start another round.');
+      ovText.innerHTML = '';
+      if (split && ranked.length > 1) {
+        const win = document.createElement('strong');
+        win.textContent = ranked[0].p === net.me ? 'You win' : ranked[0].n + ' wins';
+        ovText.append(win, ` with ${fmt(ranked[0].sc)} points`);
+      } else {
+        ovText.innerHTML = `${split ? 'Score' : 'Team score'} <strong>${fmt(s.sc)}</strong> &middot; <strong>${s.ln}</strong> lines` +
+          (split ? '' : ` &middot; level <strong>${s.lv}</strong>`);
+      }
+      if (!net.host) ovText.insertAdjacentHTML('beforeend', '<br>Waiting for the host to start another round.');
       ovList.hidden = false;
       const avs = peerAvatars();
-      s.ro.slice().sort((a, b) => b.sc - a.sc).forEach((r, i) => {
+      ranked.forEach((r, i) => {
         const li = document.createElement('li');
         if (r.p === net.me) li.className = 'me';
         const rank = document.createElement('span');
@@ -1271,12 +1316,16 @@
         popups.push({ text: NAMES[n], sub: (who ? who.n + ' ' : '') + '+' + fmt(pts), t: 0 });
         sfx.clear(n);
         // Rebuild the board as it looked just before the clear, so the rows can vanish in place.
+        // On a split board only the clearing player's columns moved.
         if (c.v === s.v && Array.isArray(c.w) && c.w.length === n) {
-          const pre = rows.slice(n).map(r => r.slice());
+          const part = isInt(c.x0, 0, COLS - 1) && isInt(c.x1, c.x0 + 1, COLS);
+          const x0 = part ? c.x0 : 0, x1 = part ? c.x1 : COLS;
+          const segs = rows.slice(n).map(r => r.slice(x0, x1));
           const order = c.r.map((y, i) => [y, i]).sort((a, b) => a[0] - b[0]);
-          for (const [y, i] of order) pre.splice(y, 0, decodeRow(c.w[i]) || emptyRow());
-          clearFx = { rows: c.r.slice(), pre, t: 0 };
-          burstRows(c.r, pre);
+          for (const [y, i] of order) segs.splice(y, 0, (decodeRow(c.w[i]) || emptyRow()).slice(x0, x1));
+          const pre = rows.map((r, y) => r.slice(0, x0).concat(segs[y], r.slice(x1)));
+          clearFx = { rows: c.r.slice(), pre, t: 0, x0, x1 };
+          burstRows(c.r, pre, x0, x1);
         }
       }
     }
@@ -1295,12 +1344,16 @@
         ln: isInt(r.ln, 0, 1e7) ? r.ln : 0,
         q: isInt(r.q, 0, 1e9) ? r.q : 0,
         gone: r.gone ? 1 : 0,
+        z: isInt(r.z, 0, MAX_PLAYERS - 1) ? r.z : -1,
+        o: r.o ? 1 : 0,
       }));
     return {
       st: s.st === 'play' || s.st === 'over' ? s.st : 'wait',
       ro,
       n: cleanLobbyName(s.n),
       pub: s.pub ? 1 : 0,
+      md: s.md === 1 ? 1 : 0,
+      nz: isInt(s.nz, 1, MAX_PLAYERS) ? s.nz : 0,
       gid: isInt(s.gid, 0, 1e9) ? s.gid : 0,
       v: isInt(s.v, 0, 1e12) ? s.v : 0,
       sc: isInt(s.sc, 0, 1e13) ? s.sc : 0,
@@ -1328,18 +1381,27 @@
 
     if (s.st === 'wait') {
       if (state !== 'idle') { state = 'idle'; cur = null; clearFx = null; overlay.hidden = true; net.pcKey = ''; }
+      lane = null;
       goScreen('lobby');
       renderLobby();
       return;
     }
 
+    lane = laneOf(s, mine);
     if (s.st === 'play' && mine && (s.gid !== net.gid || state === 'idle')) startMultiGame(s);
     else if (current() !== 'game') { if (current() === 'profile') commitProfileEdits(); showScreen('game'); }
 
     const dirty = mine ? ackPending(mine.q) : false;
     if (Array.isArray(s.b) && s.v !== net.lastV) applyBoard(s);
     else if (dirty) rebuildBoard();
-    level = s.lv;
+    // On a split board the host can rule this player out (a piece locked above the top).
+    if (isSplit(s) && mine && mine.o && (state === 'play' || state === 'countdown')) {
+      state = 'out';
+      cur = null;
+      net.pcKey = '';
+      popups.push({ text: 'NO ROOM', sub: 'your area is full', t: 0 });
+    }
+    level = isSplit(s) ? playerLevel(mine) : s.lv;
     updateHudMulti();
     renderPlayers();
     if (s.st === 'over' && state !== 'over') multiGameOver();
@@ -1353,8 +1415,13 @@
     net.myLocks = []; net.pending = []; net.myKo = 0; net.lastV = -1; net.pcKey = '';
     resetPieces();
     otherVis.clear();
-    level = s.lv;
+    level = isSplit(s) ? playerLevel(mine) : s.lv;
     state = 'countdown'; countdownT = 2400; lastBeep = 4;
+    // Joined a split round after it started: there's no area to play in until the next one.
+    if (isSplit(s) && !lane) {
+      state = 'out';
+      popups.push({ text: 'WATCHING', sub: 'you play from the next round', t: 0 });
+    }
     overlay.hidden = true;
     sendPlay({ g: s.gid, lk: [], ko: 0, pc: null });
     audioOn();
@@ -1380,6 +1447,17 @@
     const s = net.hs;
     if (!s) return;
     const mine = myEntry();
+    if (isSplit(s)) {
+      const players = s.ro.filter(r => r.z >= 0);
+      const place = mine && mine.z >= 0 ? 1 + players.filter(r => r.sc > mine.sc).length : 0;
+      lblScore.textContent = 'Score';
+      lblBest.textContent = 'Place';
+      scoreEl.textContent = fmt(mine ? mine.sc : 0);
+      linesEl.textContent = mine ? mine.ln : 0;
+      levelEl.textContent = playerLevel(mine);
+      bestEl.textContent = place ? place + ' / ' + players.length : '–';
+      return;
+    }
     lblScore.textContent = 'Team';
     lblBest.textContent = 'You';
     scoreEl.textContent = fmt(s.sc);
@@ -1415,6 +1493,11 @@
       const byPeer = new Map(net.P.peers().map(p => [p.peer, p]));
       changed = syncRoster(byPeer);
       if (net.st.st === 'play') changed = processLocks(byPeer) || changed;
+      // A split round lasts until every player still here has run out of room.
+      if (net.st.st === 'play' && isSplit(net.st) && !net.st.ro.some(r => r.z >= 0 && !r.gone && !r.o)) {
+        net.st.st = 'over';
+        changed = true;
+      }
     } finally {
       net.ticking = false;
     }
@@ -1464,7 +1547,7 @@
     fresh.sort((a, b) => (Number(a.presence.t0) || 0) - (Number(b.presence.t0) || 0));
     for (const p of fresh) {
       if (activeRoster(st).length >= MAX_PLAYERS) break;
-      st.ro.push({ p: p.peer, s: freeSlot(st), n: cleanName(p.presence.n), sc: 0, ln: 0, q: 0, gone: 0 });
+      st.ro.push({ p: p.peer, s: freeSlot(st), n: cleanName(p.presence.n), sc: 0, ln: 0, q: 0, gone: 0, z: -1, o: 0 });
       changed = true;
     }
     return changed;
@@ -1473,8 +1556,9 @@
   function processLocks(byPeer) {
     const st = net.st;
     let changed = false;
+    const split = isSplit(st);
     for (const r of st.ro) {
-      if (r.gone || st.st !== 'play') continue;
+      if (r.gone || r.o || st.st !== 'play') continue;
       const own = r.p === net.me;
       const peer = own ? null : byPeer.get(r.p);
       const pr = peer ? peer.presence : null;
@@ -1485,11 +1569,15 @@
           r.q = l.s;
           changed = true;
           hostApplyLock(r, l);
-          if (st.st !== 'play') break;
+          if (st.st !== 'play' || r.o) break;
         }
       }
+      // Running out of room ends a shared round for everyone, but only that player's split round.
       const ko = own ? net.myKo : pr && pr.ko;
-      if (st.st === 'play' && ko === st.gid) { st.st = 'over'; changed = true; }
+      if (st.st === 'play' && ko === st.gid) {
+        if (split) { if (!r.o && r.z >= 0) { r.o = 1; changed = true; } }
+        else { st.st = 'over'; changed = true; }
+      }
     }
     return changed;
   }
@@ -1497,7 +1585,11 @@
   function hostApplyLock(r, l) {
     const st = net.st, hb = net.hb;
     if (!TYPES.includes(l.t) || !isInt(l.r, 0, 3) || !isInt(l.x, -3, COLS) || !isInt(l.y, -4, H) || !isInt(l.c, 0, GAME_COLORS.length - 1)) return;
-    const hit = y => collideOn(hb, l.t, l.r, l.x, y);
+    // On a split board a piece must sit inside its owner's area, which is all that can clear.
+    const lim = laneOf(st, r);
+    if (isSplit(st) && !lim) return;
+    const x0 = lim ? lim.x0 : 0, x1 = lim ? lim.x1 : COLS;
+    const hit = y => collideOn(hb, l.t, l.r, l.x, y, lim);
     // Two players can lock into the same space: the later piece lands on top.
     // A piece left floating by a line clear it didn't see yet drops onto the stack.
     let y = l.y;
@@ -1519,20 +1611,35 @@
     st.sc += d;
     st.v += 1;
     const full = [];
-    for (let yy = 0; yy < H; yy++) if (hb[yy].every(Boolean)) full.push(yy);
+    for (let yy = 0; yy < H; yy++) {
+      let ok = true;
+      for (let x = x0; x < x1 && ok; x++) ok = !!hb[yy][x];
+      if (ok) full.push(yy);
+    }
     if (full.length) {
       const n = full.length;
-      const pts = [0, 500, 1500, 2500, 4000][Math.min(4, n)] * st.lv;
+      const pts = [0, 500, 1500, 2500, 4000][Math.min(4, n)] * (lim ? playerLevel(r) : st.lv);
       r.sc += pts; r.ln += n;
       st.sc += pts; st.ln += n;
       st.lv = 1 + Math.floor(st.ln / LINES_PER_LEVEL);
       st.clr = { v: st.v, r: full, w: full.map(yy => encodeRow(hb[yy])), p: r.p, pts, n };
       const cleared = new Set(full);
-      const kept = hb.filter((_, yy) => !cleared.has(yy));
-      while (kept.length < H) kept.unshift(emptyRow());
-      net.hb = kept;
+      if (lim) {
+        // Drop only this area's columns; the rest of each row stays where it is.
+        st.clr.x0 = x0;
+        st.clr.x1 = x1;
+        const segs = hb.filter((_, yy) => !cleared.has(yy)).map(row => row.slice(x0, x1));
+        while (segs.length < H) segs.unshift(Array(x1 - x0).fill(null));
+        for (let yy = 0; yy < H; yy++) for (let x = x0; x < x1; x++) hb[yy][x] = segs[yy][x - x0];
+      } else {
+        const kept = hb.filter((_, yy) => !cleared.has(yy));
+        while (kept.length < H) kept.unshift(emptyRow());
+        net.hb = kept;
+      }
     }
-    if (allHidden) st.st = 'over';
+    if (allHidden) {
+      if (lim) r.o = 1; else st.st = 'over';
+    }
   }
 
   function hostPublish() {
@@ -1557,8 +1664,17 @@
     st.gid += 1;
     st.v = 1;
     st.sc = 0; st.ln = 0; st.lv = 1; st.clr = null;
-    for (const r of st.ro) { r.sc = 0; r.ln = 0; r.q = 0; }
+    for (const r of st.ro) { r.sc = 0; r.ln = 0; r.q = 0; r.o = 0; r.z = -1; }
+    // Split board: areas go left to right in slot order and stay fixed for the round.
+    st.nz = st.md === 1 ? st.ro.length : 0;
+    if (st.nz) st.ro.slice().sort((a, b) => a.s - b.s).forEach((r, i) => { r.z = i; });
     net.hb = emptyBoard();
+    hostPublish();
+  }
+
+  function hostSetMode(md) {
+    if (!net.host || !net.st || net.st.st !== 'wait' || net.st.md === md) return;
+    net.st.md = md;
     hostPublish();
   }
 
@@ -1573,7 +1689,7 @@
   // Public lobbies are listed through the host's presence in the shared room.
   function updateAdvert() {
     if (!net.L || !net.host || !net.pub || !net.st) return;
-    const lob = { pv: PROTOCOL, c: net.code, n: net.st.n, hn: profile ? profile.name : '', pl: activeRoster(net.st).length, st: net.st.st };
+    const lob = { pv: PROTOCOL, c: net.code, n: net.st.n, hn: profile ? profile.name : '', pl: activeRoster(net.st).length, st: net.st.st, md: net.st.md };
     const key = JSON.stringify(lob);
     if (key === net.advKey) return;
     net.advKey = key;
@@ -1605,25 +1721,17 @@
     const lib = window.mqtt;
     if (!lib || typeof lib.connect !== 'function') throw new Error('MQTT library missing');
     const me = Array.from(crypto.getRandomValues(new Uint8Array(12)), b => 'abcdefghijklmnopqrstuvwxyz0123456789'[b % 36]).join('');
-    const client = lib.connect(MQTT_URL, { clientId: 'gt-' + me, clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 10000 });
     const rooms = new Map();
     const connFns = new Set();
     const decoder = new TextDecoder();
-    let isUp = false;
+    let isUp = false, client = null, downSince = 0;
 
     const setUp = up => {
       if (up === isUp) return;
       isUp = up;
       for (const fn of connFns) fn(up);
     };
-    client.on('connect', () => {
-      setUp(true);
-      for (const r of rooms.values()) r._subscribe();
-    });
-    client.on('close', () => setUp(false));
-    client.on('offline', () => setUp(false));
-    client.on('error', err => console.warn('multiplayer server', err && err.message));
-    client.on('message', (topic, payload) => {
+    function onMessage(topic, payload) {
       if (!topic.startsWith(MQTT_PREFIX)) return;
       const rest = topic.slice(MQTT_PREFIX.length), cut = rest.lastIndexOf('/');
       const room = rooms.get(rest.slice(0, cut));
@@ -1631,9 +1739,38 @@
       let msg;
       try { msg = JSON.parse(decoder.decode(payload)); } catch (e) { return; }
       if (msg && typeof msg === 'object') room._receive(rest.slice(cut + 1), msg);
-    });
+    }
+    function openClient() {
+      const c = lib.connect(MQTT_URL, { clientId: 'gt-' + me, clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 10000 });
+      c.on('connect', () => {
+        if (c !== client) return;
+        setUp(true);
+        for (const r of rooms.values()) r._subscribe();
+      });
+      c.on('close', () => { if (c === client) setUp(false); });
+      c.on('offline', () => { if (c === client) setUp(false); });
+      c.on('error', err => console.warn('multiplayer server', err && err.message));
+      c.on('message', onMessage);
+      return c;
+    }
+    client = openClient();
+    // After a keepalive timeout in a throttled background tab, mqtt.js can get stuck
+    // "disconnecting" and never retry. Once the page is visible again, start a fresh client.
+    function watchdog(limitMs) {
+      if (client.connected) { downSince = 0; return; }
+      if (!downSince) { downSince = Date.now(); return; }
+      if (document.hidden || Date.now() - downSince < limitMs) return;
+      downSince = Date.now();
+      const old = client;
+      client = openClient();
+      try { old.removeAllListeners(); old.on('error', noop); old.end(true); } catch (e) {}
+    }
+    document.addEventListener('visibilitychange', () => watchdog(4000));
     window.addEventListener('pagehide', () => { for (const r of rooms.values()) r._bye(); });
-    setInterval(() => { for (const r of rooms.values()) r._tick(); }, 1000);
+    setInterval(() => {
+      watchdog(10000);
+      for (const r of rooms.values()) r._tick();
+    }, 1000);
 
     function makeRoom(name) {
       const topic = MQTT_PREFIX + name + '/';
@@ -1870,7 +2007,7 @@
     if (net.host) {
       net.hostPeer = net.me;
       net.hb = emptyBoard();
-      net.st = { h: 1, pv: PROTOCOL, c: code, n: net.lobbyName, pub: net.pub ? 1 : 0, st: 'wait', gid: 0, v: 0, b: null, sc: 0, ln: 0, lv: 1, ro: [], clr: null };
+      net.st = { h: 1, pv: PROTOCOL, c: code, n: net.lobbyName, pub: net.pub ? 1 : 0, md: opts.mode === 1 ? 1 : 0, nz: 0, st: 'wait', gid: 0, v: 0, b: null, sc: 0, ln: 0, lv: 1, ro: [], clr: null };
       hostTick();
       hostPublish();
     } else {
@@ -1902,6 +2039,7 @@
     mode = 'solo';
     state = 'idle';
     cur = null;
+    lane = null;
     clearFx = null;
     otherVis.clear();
     overlay.hidden = true;
@@ -1970,6 +2108,7 @@
         host: cleanName(lob.hn) || 'Someone',
         pl: isInt(lob.pl, 0, MAX_PLAYERS) ? lob.pl : 0,
         st: lob.st === 'wait' ? 'wait' : 'play',
+        split: lob.md === 1,
         mine: p.peer === net.me,
       });
     }
@@ -1985,7 +2124,7 @@
       nm.textContent = it.name;
       const meta = document.createElement('div');
       meta.className = 'lob-meta';
-      meta.textContent = 'Hosted by ' + it.host;
+      meta.textContent = 'Hosted by ' + it.host + ' · ' + (it.split ? 'Split board' : 'Shared board');
       main.append(nm, meta);
       const chip = document.createElement('span');
       chip.className = 'chip ' + it.st;
@@ -2014,6 +2153,25 @@
       ? 'Listed under public lobbies for everyone on this page. The invite code works too.'
       : 'Hidden from the list. Friends join with the invite code.';
   }
+
+  const MODE_HINTS = [
+    'Everyone builds on one board and clears lines together.',
+    'The board is cut into one area per player and only you can drop pieces in yours. Play until your area fills up; the highest score wins.',
+  ];
+  function markMode(shared, split, md) {
+    shared.setAttribute('aria-pressed', String(md === 0));
+    split.setAttribute('aria-pressed', String(md === 1));
+  }
+  let createMode = 0;
+  function setCreateMode(md) {
+    createMode = md;
+    markMode(modeShared, modeSplit, md);
+    modeHint.textContent = MODE_HINTS[md];
+  }
+  modeShared.addEventListener('click', () => setCreateMode(0));
+  modeSplit.addEventListener('click', () => setCreateMode(1));
+  lobbyShared.addEventListener('click', () => hostSetMode(0));
+  lobbySplit.addEventListener('click', () => hostSetMode(1));
   soloBtn.addEventListener('click', startSolo);
   createBtn.addEventListener('click', () => {
     createForm.hidden = false;
@@ -2030,7 +2188,7 @@
     const name = cleanLobbyName(lobbyNameInput.value) || cleanLobbyName((profile ? profile.name : 'My') + '’s lobby');
     createForm.hidden = true;
     createBtn.hidden = false;
-    enterLobby(makeCode(), { host: true, pub: createPub, name });
+    enterLobby(makeCode(), { host: true, pub: createPub, name, mode: createMode });
   });
   codeInput.addEventListener('input', () => {
     const v = codeInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
@@ -2093,6 +2251,12 @@
       li.append(img, nm, tags);
       slotsEl.append(li);
     }
+    const md = s ? s.md : 0;
+    markMode(lobbyShared, lobbySplit, md);
+    lobbyShared.disabled = lobbySplit.disabled = !net.host;
+    lobbyModeHint.textContent = md === 1
+      ? `Each player gets ${act.length > 1 ? 'about ' + Math.floor(COLS / act.length) : 'all ' + COLS} columns of their own. Play until your area fills up; the highest score wins.`
+      : MODE_HINTS[0];
     const mine = myEntry();
     startBtn.hidden = !net.host;
     startBtn.disabled = !mine;
@@ -2124,7 +2288,7 @@
     if (!show) return;
     const s = net.hs, avs = peerAvatars();
     const list = s.ro.slice().sort((a, b) => a.gone - b.gone || a.s - b.s);
-    const sig = list.map(r => [r.p, r.s, r.n, r.sc, r.ln, r.gone, avs.get(r.p) || ''].join('~')).join('|');
+    const sig = list.map(r => [r.p, r.s, r.n, r.sc, r.ln, r.gone, r.o, avs.get(r.p) || ''].join('~')).join('|');
     if (sig === net.playersSig) return;
     net.playersSig = sig;
     playersEl.textContent = '';
@@ -2141,7 +2305,7 @@
       nm.textContent = r.n + (r.p === net.me ? ' (you)' : '');
       const sc = document.createElement('div');
       sc.className = 'pl-score';
-      sc.textContent = fmt(r.sc) + ' · ' + r.ln + (r.ln === 1 ? ' line' : ' lines') + (r.gone ? ' · left' : '');
+      sc.textContent = fmt(r.sc) + ' · ' + r.ln + (r.ln === 1 ? ' line' : ' lines') + (r.gone ? ' · left' : r.o ? ' · out' : '');
       txt.append(nm, sc);
       el.append(img, txt);
       playersEl.append(el);
@@ -2738,14 +2902,15 @@
   }
 
   // Rows being cleared flash white, then vanish outward from the middle.
-  function drawClearing(rows, src, ms) {
-    const W = COLS * cs, T = ms / CLEAR_MS;
+  function drawClearing(rows, src, ms, x0 = 0, x1 = COLS) {
+    const W = (x1 - x0) * cs, cx = (x0 + x1) / 2 * cs, T = ms / CLEAR_MS;
+    const mid = (x0 + x1) / 2, hw = (x1 - x0) / 2;
     for (const y of rows) {
       const py = (y - HIDDEN) * cs;
-      for (let x = 0; x < COLS; x++) {
+      for (let x = x0; x < x1; x++) {
         const color = src[y] && src[y][x];
         if (!color) continue;
-        const delay = Math.abs(x + 0.5 - COLS / 2) / (COLS / 2) * 0.55;
+        const delay = Math.abs(x + 0.5 - mid) / hw * 0.55;
         const k = Math.min(1, Math.max(0, (T - delay) / 0.45));
         if (k >= 1) continue;
         const s = cs * (1 - k * k);
@@ -2757,12 +2922,12 @@
       }
       const half = Math.min(1, T * 1.4) * W / 2;
       if (half > 1) {
-        const band = ctx.createLinearGradient(W / 2 - half, 0, W / 2 + half, 0);
+        const band = ctx.createLinearGradient(cx - half, 0, cx + half, 0);
         band.addColorStop(0, 'rgba(255,255,255,0)');
         band.addColorStop(0.5, `rgba(255,255,255,${0.25 * Math.max(0, 1 - T)})`);
         band.addColorStop(1, 'rgba(255,255,255,0)');
         ctx.fillStyle = band;
-        ctx.fillRect(W / 2 - half, py - cs * 0.3, half * 2, cs * 1.6);
+        ctx.fillRect(cx - half, py - cs * 0.3, half * 2, cs * 1.6);
       }
     }
   }
@@ -2819,7 +2984,34 @@
     ctx.setLineDash([6, 6]);
     ctx.strokeRect(z.x0 * cs + 0.5, 0.5, (z.x1 - z.x0) * cs - 1, Hh - 1);
     ctx.setLineDash([]);
-    drawTag('YOUR PIECES START HERE', z.color, (z.x0 + z.x1) / 2 * cs, cs * 2.2);
+    drawTag(isSplit(net.hs) ? 'YOUR AREA' : 'YOUR PIECES START HERE', z.color, (z.x0 + z.x1) / 2 * cs, cs * 2.2);
+  }
+
+  // Split board: a faint wash behind your own area (front = false), then dividers between
+  // areas and a dimmed area for anyone who is out or has left (front = true).
+  function drawLanes(front) {
+    const s = net.hs, Hh = ROWS * cs;
+    if (!front) {
+      const z = myZone();
+      if (z && state !== 'countdown') {
+        ctx.fillStyle = rgba(z.color, 0.05);
+        ctx.fillRect(z.x0 * cs, 0, (z.x1 - z.x0) * cs, Hh);
+      }
+      return;
+    }
+    for (let k = 0; k < s.nz; k++) {
+      const { x0, x1 } = laneCols(k, s.nz);
+      const r = s.ro.find(e => e.z === k);
+      if (!r || r.gone || r.o) {
+        ctx.fillStyle = 'rgba(8,7,24,0.55)';
+        ctx.fillRect(x0 * cs, 0, (x1 - x0) * cs, Hh);
+        drawTag(!r || r.gone ? 'LEFT' : 'OUT', 'rgba(170,160,255,0.7)', (x0 + x1) / 2 * cs, Hh / 2);
+      }
+      if (k > 0) {
+        ctx.fillStyle = 'rgba(190,180,255,0.4)';
+        ctx.fillRect(x0 * cs - 1, 0, 2, Hh);
+      }
+    }
   }
 
   function drawCountdown() {
@@ -2844,11 +3036,13 @@
     ctx.clearRect(0, 0, W, Hh);
     if (shake > 0.3) ctx.translate((Math.random() - 0.5) * shake * 0.4, Math.random() * shake * 0.6);
     if (bgLayer) ctx.drawImage(bgLayer, 0, 0, W, Hh);
+    const split = multi && isSplit(net.hs);
+    if (split) drawLanes(false);
     if (multi && state === 'countdown') drawZone();
 
     const view = multi && clearFx ? clearFx.pre : board;
-    let clearing = null, clearMs = 0;
-    if (multi && clearFx) { clearing = clearFx.rows; clearMs = clearFx.t; }
+    let clearing = null, clearMs = 0, cx0 = 0, cx1 = COLS;
+    if (multi && clearFx) { clearing = clearFx.rows; clearMs = clearFx.t; cx0 = clearFx.x0; cx1 = clearFx.x1; }
     else if (!multi && state === 'clearing') { clearing = clearRows; clearMs = clearT; }
     const clearSet = clearing ? new Set(clearing) : null;
 
@@ -2856,12 +3050,12 @@
 
     if (state === 'over') ctx.globalAlpha = 0.45;
     for (let y = HIDDEN; y < H; y++) {
-      if (clearSet && clearSet.has(y)) continue;
-      const row = view[y];
-      for (let x = 0; x < COLS; x++) if (row[x]) drawCell(row[x], x, y);
+      const row = view[y], gone = clearSet && clearSet.has(y);
+      for (let x = 0; x < COLS; x++) if (row[x] && !(gone && x >= cx0 && x < cx1)) drawCell(row[x], x, y);
     }
     ctx.globalAlpha = 1;
-    if (clearing) drawClearing(clearing, view, clearMs);
+    if (clearing) drawClearing(clearing, view, clearMs, cx0, cx1);
+    if (split) drawLanes(true);
 
     // Hard drop streaks.
     for (const tr of trails) {
@@ -3032,6 +3226,7 @@
   new ResizeObserver(() => drawMenuArt()).observe(screens.menu);
   renderMeChip();
   setVisibility(true);
+  setCreateMode(0);
   if (profile) showScreen('menu'); else openProfile(true);
   updateNetUi();
   initRoom();
